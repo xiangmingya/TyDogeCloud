@@ -254,7 +254,41 @@ namespace {
         dogeCheck(strpos($changed, 'https://new-images.example/') === 0, 'Domain switch failed to update an old stored URL');
         \TyDogeCloud_Plugin::configHandle($saved, false);
         dogeCheck(count(\Typecho\Plugin::export()['handles']['Widget_Archive:beforeRender']) === 1, 'Repeated settings save duplicated hooks');
-        echo "检查通过：上传、签名、错误处理、设置入口、钩子、MIME 兼容、旧附件映射、固定存储位置、域名与规则转换、重复转换、第三方隔离、升级和历史域名保存。\n";
+        dogeCheck(isset(\Typecho\Plugin::export()['handles'][\Typecho\Common::nativeClassName(\Widget\Contents\Attachment\Edit::class) . ':delete']), 'Pre-delete hook was not registered');
+        // Exercise the actual Typecho deleteByIds flow: no production DB or cloud calls.
+        class TyDogeCloudDeleteCheck extends \Widget\Contents\Attachment\Edit {
+            public bool $writable = true;
+            public static function pluginHandle(): \Typecho\Plugin { return \Typecho\Plugin::factory(\Widget\Contents\Attachment\Edit::class); }
+            public function isWriteable(\Typecho\Db\Query $condition): bool { return $this->writable; }
+            public function runDelete(int $cid): int { $count = 0; $this->deleteByIds([$cid], $count); return $count; }
+        }
+        \Typecho\Plugin::factory(TyDogeCloudDeleteCheck::class)->delete = [\TyDogeCloud_Plugin::class, 'beforeAttachmentDelete'];
+        $pdo->exec('CREATE TABLE typecho_contents (cid INTEGER PRIMARY KEY, authorId INTEGER, type TEXT, text TEXT, parent INTEGER, created INTEGER)');
+        $pdo->exec('CREATE TABLE typecho_comments (cid INTEGER)');
+        $attachmentInsert = $pdo->prepare('INSERT INTO typecho_contents VALUES (?,1,?,?,0,?)');
+        foreach ([9001, 9002, 9003] as $id) $attachmentInsert->execute([$id, 'attachment', json_encode($uploaded), time()]);
+        $editor = (new \ReflectionClass(TyDogeCloudDeleteCheck::class))->newInstanceWithoutConstructor();
+        (new \ReflectionProperty(\Widget\Base::class, 'db'))->setValue($editor, $db);
+        (new \ReflectionProperty(\Typecho\Widget::class, 'request'))->setValue($editor, new \Typecho\Widget\Request(\Typecho\Request::getInstance()));
+        $settings->deleteRemote = '1';
+        $GLOBALS['dogeResponse'] = '{"code":401,"msg":"MY_SECRET_KEY must not be displayed"}';
+        dogeThrows(fn() => $editor->runDelete(9001), 'Cloud failure must abort the real core deletion');
+        dogeCheck((int) $pdo->query('SELECT COUNT(*) FROM typecho_contents WHERE cid=9001')->fetchColumn() === 1, 'Cloud failure removed the attachment record');
+        $GLOBALS['dogeResponse'] = '{"code":200}';
+        $count = count($GLOBALS['dogeRequests']);
+        dogeCheck($editor->runDelete(9001) === 1, 'Cloud success did not complete core deletion');
+        dogeCheck(count($GLOBALS['dogeRequests']) === $count + 1, 'Core post-delete hook repeated the cloud deletion');
+        dogeCheck((int) $pdo->query('SELECT COUNT(*) FROM typecho_contents WHERE cid=9001')->fetchColumn() === 0, 'Successful deletion kept the record');
+        $editor->writable = false;
+        $count = count($GLOBALS['dogeRequests']);
+        dogeCheck($editor->runDelete(9002) === 0 && count($GLOBALS['dogeRequests']) === $count, 'Permission denial still deleted a cloud object');
+        dogeCheck((int) $pdo->query('SELECT COUNT(*) FROM typecho_contents WHERE cid=9002')->fetchColumn() === 1, 'Permission denial removed the record');
+        $editor->writable = true;
+        $settings->deleteRemote = '0';
+        dogeCheck($editor->runDelete(9003) === 1 && count($GLOBALS['dogeRequests']) === $count, 'Keep-files setting was ignored');
+        dogeCheck(strpos(file_get_contents($temp . '/errors.log'), 'MY_SECRET_KEY') === false, 'Deletion failure leaked credentials');
+
+        echo "检查通过：上传签名、设置钩子、类型兼容、旧路径、域名规则转换、升级保存，以及云端删除失败保留记录、权限校验和防重复请求。\n";
     } finally {
         ini_set('error_log', $previousLog);
         foreach (glob($temp . '/*') as $file) unlink($file);

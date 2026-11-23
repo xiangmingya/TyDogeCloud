@@ -51,6 +51,31 @@ class TyDogeCloud_Url
         return $rule;
     }
 
+    private static function thumbnailRule(string $rule, int $edge): ?string
+    {
+        if ($edge < 1 || $edge > 2048 || ($rule !== '' && $rule[0] !== '?')) {
+            return null;
+        }
+        $steps = $rule === '' ? [] : explode('|', substr($rule, 1));
+        if (end($steps) === 'imageMogr2/format/webp') {
+            array_pop($steps);
+        }
+        $steps[] = "imageMogr2/thumbnail/{$edge}x{$edge}/format/webp";
+        return '?' . implode('|', $steps);
+    }
+
+    public static function thumbnail(string $url, string $domain, string $rule, int $edge): ?string
+    {
+        $variant = self::thumbnailRule($rule, $edge);
+        $parts = parse_url($url);
+        if ($variant === null || !$parts || self::authority($parts) !== self::authority(parse_url($domain) ?: [])
+            || !preg_match('~\.(?:jpe?g|png|webp)$~iD', $parts['path'] ?? '')) {
+            return null;
+        }
+        $result = self::rewrite($url, $domain, [self::authority($parts)], $variant);
+        return $result === $url ? null : $result;
+    }
+
     public static function rewrite(string $url, string $domain, array $hosts, string $rule): string
     {
         $escaped = strpos($url, '&amp;') !== false || strpos($url, '&#38;') !== false || strpos($url, '&#x26;') !== false;
@@ -72,8 +97,16 @@ class TyDogeCloud_Url
             return $escaped ? str_replace('&', '&amp;', $result) : $result;
         }
         $query = [];
+        $isDeliveryHost = self::authority($parts) === self::authority(parse_url($domain) ?: []);
         foreach (explode('&', $parts['query'] ?? '') as $param) {
             if ($param === '') {
+                continue;
+            }
+            // Keep our own size variants when the page output is rewritten a second time.
+            if ($isDeliveryHost
+                && preg_match('~(?:^|\|)imageMogr2/thumbnail/([1-9][0-9]{0,3})x\1/format/webp$~D', $param, $size)
+                && self::thumbnailRule($rule, (int) $size[1]) === '?' . $param) {
+                $rule = '?' . $param;
                 continue;
             }
             $name = rawurldecode(explode('=', $param, 2)[0]);

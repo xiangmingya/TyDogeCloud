@@ -4,7 +4,7 @@
  *
  * @package TyDogeCloud
  * @author 湘铭呀
- * @version 1.1.0
+ * @version 1.2.0
  * @since 1.3.0
  * @link https://github.com/xiangmingya/TyDogeCloud
  */
@@ -22,6 +22,7 @@ require_once __DIR__ . '/Url.php';
 class TyDogeCloud_Plugin implements PluginInterface
 {
     private static int $bufferLevel = 0;
+    private static array $deletedAttachments = [];
 
     public static function activate()
     {
@@ -48,6 +49,8 @@ class TyDogeCloud_Plugin implements PluginInterface
         }
         \Typecho\Plugin::factory(\Widget\Archive::class)->beforeRender = [__CLASS__, 'beforeRender'];
         \Typecho\Plugin::factory(\Widget\Archive::class)->afterRender = [__CLASS__, 'afterRender'];
+        \Typecho\Plugin::factory(\Widget\Contents\Attachment\Edit::class)->delete = [__CLASS__, 'beforeAttachmentDelete'];
+        \Typecho\Plugin::factory('admin/footer.php')->begin = [__CLASS__, 'editorFooter'];
     }
 
     public static function deactivate()
@@ -71,7 +74,7 @@ class TyDogeCloud_Plugin implements PluginInterface
         $form->addInput(new Form\Element\Radio('mapLegacy', ['1' => '已迁移，使用新域名', '0' => '保持原本地地址'], '1',
             '旧附件路径映射', '默认按旧附件已迁移处理：/usr/uploads/年/月/文件 → 当前前缀/年/月/文件。不会搬运文件或修改文章正文。'));
         $form->addInput(new Form\Element\Radio('deleteRemote', ['0' => '保留云端文件', '1' => '同步删除云端文件'], '0',
-            '删除附件时', '默认仅删除 Typecho 附件记录。开启后也会删除已映射的旧附件；请先确认迁移目录无误。'));
+            '删除附件时', '选择同步删除后，确认删除附件会同时删除桶中的文件，且不可恢复；云端删除失败时保留附件记录。也适用于已映射的旧附件。'));
         $form->addInput(new Form\Element\Radio('rewriteImages', ['1' => '开启', '0' => '关闭'], '1',
             '展示时统一图片地址', '统一处理文章、摘要、RSS，以及主题输出的缩略图和广告图；不修改数据库中的原文。'));
         $form->addInput(new Form\Element\Textarea('legacyDomains', null, "yop.xiangming.site\nimg.xiangming.site", '历史图片域名',
@@ -83,6 +86,62 @@ class TyDogeCloud_Plugin implements PluginInterface
 
     public static function personalConfig(Form $form)
     {
+    }
+
+    public static function editorFooter(): void
+    {
+        $deleteRemote = (string) self::options()->deleteRemote === '1';
+        $deleteUrl = \Widget\Security::alloc()->getIndex('/action/contents-attachment-edit');
+        $cloudAttachments = [];
+        $db = \Typecho\Db::get();
+        $cid = (int) \Typecho\Request::getInstance()->get('cid', 0);
+        $query = $db->select('cid', 'text')->from('table.contents')->where('type = ?', 'attachment');
+        if ($cid) {
+            $query->where('(parent = ? OR cid = ?)', $cid, $cid);
+        } else {
+            $query->where('parent = ?', 0)->where('authorId = ?', (int) \Widget\User::alloc()->uid);
+        }
+        foreach ($db->fetchAll($query) as $row) {
+            try {
+                $metadata = json_decode($row['text'], true);
+                $cloudAttachments[$row['cid']] = is_array($metadata)
+                    && self::location(new \Typecho\Config($metadata)) !== null;
+            } catch (\RuntimeException $e) {
+                $cloudAttachments[$row['cid']] = false;
+            }
+        }
+        require __DIR__ . '/admin.php';
+    }
+
+    /** 原生钩子在数据库删除之前触发，先验证权限并完成云端删除。 */
+    public static function beforeAttachmentDelete(int $cid, \Widget\Contents\Attachment\Edit $widget): void
+    {
+        if ((string) self::options()->deleteRemote !== '1' || isset(self::$deletedAttachments[$cid])) {
+            return;
+        }
+        $db = \Typecho\Db::get();
+        $condition = $db->sql()->where('cid = ?', $cid)->where('type = ?', 'attachment');
+        if (!$widget->isWriteable(clone $condition)) {
+            return;
+        }
+        $row = $db->fetchRow((clone $condition)->select('text')->from('table.contents'));
+        $metadata = json_decode($row['text'] ?? '', true);
+        try {
+            if (is_array($metadata) && self::location(new \Typecho\Config($metadata)) === null) {
+                return; // 未映射的本地附件不属于云端删除范围。
+            }
+            if (is_array($metadata) && self::deleteHandle(['attachment' => new \Typecho\Config($metadata)])) {
+                self::$deletedAttachments[$cid] = true;
+                return;
+            }
+        } catch (\RuntimeException $e) {
+            error_log('[TyDogeCloud] pre-delete: ' . $e->getMessage());
+        }
+        $message = '多吉云文件删除失败，本次附件记录已保留。请检查插件密钥、存储空间和服务器日志后重试。';
+        if ($widget->request->isAjax()) {
+            $widget->response->setStatus(502)->throwJson(['code' => 502, 'message' => $message]);
+        }
+        throw new \Typecho\Widget\Exception($message, 502);
     }
 
     public static function configHandle(array $settings, bool $isInit)
@@ -133,6 +192,20 @@ class TyDogeCloud_Plugin implements PluginInterface
         } catch (\RuntimeException $e) {
             error_log('[TyDogeCloud] image URL: ' . $e->getMessage());
             return $html;
+        }
+    }
+
+    public static function thumbnailUrl(string $displayUrl, int $edge): ?string
+    {
+        $options = self::options();
+        if ((string) ($options->rewriteImages ?? '1') === '0') {
+            return null;
+        }
+        try {
+            return TyDogeCloud_Url::thumbnail($displayUrl, self::domain(),
+                TyDogeCloud_Url::rule((string) ($options->imageRule ?? '')), $edge);
+        } catch (\RuntimeException $e) {
+            return null;
         }
     }
 
@@ -301,6 +374,9 @@ class TyDogeCloud_Plugin implements PluginInterface
 
     public static function deleteHandle(array $content): bool
     {
+        if (isset($content['cid'], self::$deletedAttachments[$content['cid']])) {
+            return true; // 已在数据库删除前完成，避免核心后置钩子重复请求。
+        }
         if ((string) self::options()->deleteRemote !== '1') {
             return true;
         }
